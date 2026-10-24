@@ -134,10 +134,20 @@ fn piece(rest: &str) -> Option<(Span<'_>, usize)> {
     if let Some(inner) = rest.strip_prefix('[') {
         // Both searches run over a bounded window, never the rest of the line: `spans` retries
         // after every unmatched `[`, so an unbounded search would cost a scan per bracket.
-        let label_end = inner.get(..inner.len().min(MAX_LABEL))?.find("](")?;
+        // Snap the bound to a UTF-8 character boundary: `MAX_LABEL` is a byte count, and slicing
+        // at a byte inside a multi-byte character returns `None`, dropping a link whose label
+        // crosses the cap. `char_indices` lands on the first boundary strictly past the cap, so a
+        // character that starts before it and ends after it is still inside the window.
+        let label_cap = inner.char_indices().find(|(i, _)| *i > MAX_LABEL).map_or(inner.len(), |(i, _)| i);
+        let label_end = inner.get(..label_cap)?.find("](")?;
         let label = inner.get(..label_end)?;
         let after = inner.get(label_end + 2..)?;
-        let url_end = after.get(..after.len().min(MAX_URL))?.find(')')?;
+        // Snap the bound to a UTF-8 character boundary: `MAX_URL` is a byte count, and slicing
+        // at a byte inside a multi-byte character returns `None`, dropping a link whose URL
+        // crosses the cap. `char_indices` lands on the first boundary strictly past the cap, so a
+        // character that starts before it and ends after it is still inside the window.
+        let url_cap = after.char_indices().find(|(i, _)| *i > MAX_URL).map_or(after.len(), |(i, _)| i);
+        let url_end = after.get(..url_cap)?.find(')')?;
         let url = after.get(..url_end)?;
         // A URL is one word: `[text](url "title")` and `[text][ref]` are not links.
         if label.is_empty() || url.is_empty() || url.contains(char::is_whitespace) {
@@ -399,6 +409,20 @@ mod tests {
         // Just inside the window the same shape is still read as a link.
         let just_fits = format!("[{}](https://example.com/x)", "a".repeat(MAX_LABEL - 2));
         assert!(matches!(spans(&just_fits).as_slice(), [Span::Link { .. }]), "{:?}", spans(&just_fits));
+    }
+
+    #[test]
+    fn a_link_whose_label_crosses_the_byte_cap_is_still_read() {
+        // `MAX_LABEL` is a byte count. If the cap byte falls inside a multi-byte character
+        // in the URL that immediately follows the label, the old slice returned `None` and
+        // dropped the link. The cap now snaps to the first character boundary strictly past
+        // the cap, so a link whose label fits and whose URL starts with a multi-byte char
+        // is still parsed.
+        // Label = 123 'a' + 'é' = 125 bytes; `](` at 125,126; URL starts at 127 with 'é'
+        // (2 bytes: 127,128). Byte 128 is a continuation → old `get(..128)` returned `None`.
+        let label = format!("{}é", "a".repeat(123));
+        let line = format!("[{label}](éx)");
+        assert!(matches!(spans(&line).as_slice(), [Span::Link { .. }]), "{:?}", spans(&line));
     }
 
     #[test]
