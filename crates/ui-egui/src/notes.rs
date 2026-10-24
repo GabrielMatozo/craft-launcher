@@ -14,6 +14,10 @@ pub(crate) enum Line<'a> {
     Heading(&'a str),
     /// A bullet: its text, and the pull request link GitHub appends (`… in https://…/pull/12`).
     Bullet(&'a str, Option<&'a str>),
+    /// A markdown table row: cells are the pipe-separated fields, with the header row first.
+    /// The separator row (`|---|---|`) is not a separate variant; it's identified by all cells
+    /// being `---` (or empty after trim) and skipped when rendering.
+    Table(Vec<&'a str>),
     Text(&'a str),
     Blank,
 }
@@ -41,6 +45,16 @@ pub(crate) fn classify(line: &str) -> Line<'_> {
     }
     if let Some(h) = l.strip_prefix('#') {
         return Line::Heading(h.trim_start_matches('#').trim());
+    }
+    // Table row: starts and ends with '|', has at least two pipes (header or data).
+    if l.starts_with('|') && l.ends_with('|') && l.matches('|').count() >= 3 {
+        // Split by '|', drop first and last (empty), trim each cell.
+        let cells: Vec<&str> = l.split('|').skip(1).map(|c| c.trim()).collect();
+        // Trailing empty cell from the final '|' (e.g. "|a|b|" -> ["", "a", "b", ""]).
+        let cells = cells.into_iter().filter(|c| !c.is_empty()).collect::<Vec<_>>();
+        // If all cells are just dashes (separator row), treat as Text so it's drawn but we can
+        // skip it in draw. The caller will still get a Table variant for the header/data rows.
+        return Line::Table(cells);
     }
     if let Some(b) = l.strip_prefix("* ").or_else(|| l.strip_prefix("- ")) {
         if let Some((text, url)) = b.rsplit_once(" in https://")
@@ -212,12 +226,17 @@ fn show_lines(ui: &mut Ui, notes: &str, scale: f32) {
 }
 
 /// Where a long list folds: just before its (SHOWN + 1)th change. A short list is shown whole.
+/// Only bullets that appear after a "What's Changed" (or similar) heading are counted.
+/// A short list has SHOWN + 1 or fewer relevant bullets; a long list folds at the (SHOWN + 1)th.
 fn fold_at(lines: &[Line<'_>]) -> Option<usize> {
-    let bullets = lines.iter().filter(|l| matches!(l, Line::Bullet(..))).count();
+    // Find the index of the first "What's Changed" heading (case-insensitive, any # level).
+    let whats_changed_idx = lines.iter().position(|l| matches!(l, Line::Heading(h) if h.eq_ignore_ascii_case("What's Changed")));
+    let start = whats_changed_idx.map_or(0, |i| i + 1);
+    let bullets = lines[start..].iter().filter(|l| matches!(l, Line::Bullet(..))).count();
     if bullets <= SHOWN + 1 {
         return None;
     }
-    lines.iter().enumerate().filter(|(_, l)| matches!(l, Line::Bullet(..))).nth(SHOWN).map(|(i, _)| i)
+    lines[start..].iter().enumerate().filter(|(_, l)| matches!(l, Line::Bullet(..))).nth(SHOWN).map(|(i, _)| start + i)
 }
 
 /// The address on a "**Full Changelog**: …" line, when it is a safe web link.
@@ -249,6 +268,21 @@ fn draw(ui: &mut Ui, line: &Line<'_>, t: &Tokens, scale: f32) {
                     ui.add_space(4.0);
                     ui.hyperlink_to(RichText::new(short).size(12.0 * scale), url);
                 }
+            });
+        }
+        Line::Table(cells) => {
+            // Skip the separator row (all cells are dashes or empty after trim).
+            if cells.iter().all(|c| c.trim().chars().all(|ch| ch == '-') || c.trim().is_empty()) {
+                return;
+            }
+            ui.add_space(4.0);
+            egui::Grid::new(ui.id().with("notes-table")).striped(true).spacing([8.0 * scale, 2.0 * scale]).show(ui, |ui| {
+                for (i, cell) in cells.iter().enumerate() {
+                    let text = if marked_up(cell) { without_markup(cell) } else { (*cell).to_string() };
+                    let color = if i == 0 { t.ink } else { t.muted };
+                    ui.label(RichText::new(text).color(color).size(12.0 * scale));
+                }
+                ui.end_row();
             });
         }
         Line::Text(text) => {
@@ -305,6 +339,10 @@ mod tests {
         assert_eq!(classify("- plain bullet"), Line::Bullet("plain bullet", None));
         assert_eq!(classify("   "), Line::Blank);
         assert_eq!(classify("hello"), Line::Text("hello"));
+        // Table rows
+        assert_eq!(classify("| Tool | Score |"), Line::Table(vec!["Tool", "Score"]));
+        assert_eq!(classify("|---|---|"), Line::Table(vec!["---", "---"]));
+        assert_eq!(classify("| a | 1 |"), Line::Table(vec!["a", "1"]));
     }
 
     #[test]
@@ -315,6 +353,63 @@ mod tests {
         let few: Vec<Line> = (0..7).map(|_| Line::Bullet("change", None)).collect();
         assert_eq!(fold_at(&few), None);
         assert_eq!(fold_at(&[]), None);
+    }
+
+    #[test]
+    fn fold_at_only_counts_bullets_after_whats_changed() {
+        // Bullets before "What's Changed" don't count toward SHOWN.
+        // SHOWN = 6, short list threshold = SHOWN + 1 = 7 bullets.
+        // 7 bullets after heading = short list, no fold.
+        let notes: Vec<Line> = vec![
+            Line::Bullet("pre-change 1", None),
+            Line::Bullet("pre-change 2", None),
+            Line::Bullet("pre-change 3", None),
+            Line::Bullet("pre-change 4", None),
+            Line::Bullet("pre-change 5", None),
+            Line::Heading("What's Changed"),
+            Line::Bullet("change 1", None),
+            Line::Bullet("change 2", None),
+            Line::Bullet("change 3", None),
+            Line::Bullet("change 4", None),
+            Line::Bullet("change 5", None),
+            Line::Bullet("change 6", None),
+            Line::Bullet("change 7", None),
+        ];
+        // 7 bullets after heading = short list (≤ SHOWN+1), no fold
+        assert_eq!(fold_at(&notes), None);
+        // 8 bullets after heading = long list, fold at 7th (index 13 = 5 pre + 1 heading + 7)
+        let long: Vec<Line> = vec![
+            Line::Bullet("pre-change 1", None),
+            Line::Bullet("pre-change 2", None),
+            Line::Bullet("pre-change 3", None),
+            Line::Bullet("pre-change 4", None),
+            Line::Bullet("pre-change 5", None),
+            Line::Heading("What's Changed"),
+            Line::Bullet("change 1", None),
+            Line::Bullet("change 2", None),
+            Line::Bullet("change 3", None),
+            Line::Bullet("change 4", None),
+            Line::Bullet("change 5", None),
+            Line::Bullet("change 6", None),
+            Line::Bullet("change 7", None),
+            Line::Bullet("change 8", None),
+        ];
+        assert_eq!(fold_at(&long), Some(12));
+        // Only 6 bullets after heading = no fold
+        let few: Vec<Line> = vec![
+            Line::Heading("What's Changed"),
+            Line::Bullet("c1", None),
+            Line::Bullet("c2", None),
+            Line::Bullet("c3", None),
+            Line::Bullet("c4", None),
+            Line::Bullet("c5", None),
+            Line::Bullet("c6", None),
+        ];
+        assert_eq!(fold_at(&few), None);
+        // No heading = counts from start (old behavior)
+        let no_heading: Vec<Line> = (0..8).map(|_| Line::Bullet("c", None)).collect();
+        // 8 bullets, no heading: nth(6) gives 7th bullet at index 6
+        assert_eq!(fold_at(&no_heading), Some(6));
     }
 
     #[test]
