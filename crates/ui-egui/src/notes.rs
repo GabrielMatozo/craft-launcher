@@ -161,7 +161,26 @@ fn piece(rest: &str) -> Option<(Span<'_>, usize)> {
         // crosses the cap. `char_indices` lands on the first boundary strictly past the cap, so a
         // character that starts before it and ends after it is still inside the window.
         let url_cap = after.char_indices().find(|(i, _)| *i > MAX_URL).map_or(after.len(), |(i, _)| i);
-        let url_end = after.get(..url_cap)?.find(')')?;
+        // Find the matching closing paren by counting nested parentheses.
+        // Wikipedia links like `_(disambiguation)` have parens inside; we need the *matching* one.
+        let url_end = after.get(..url_cap).and_then(|window| {
+            let mut depth = 0;
+            window.char_indices().find_map(|(i, ch)| match ch {
+                '(' => {
+                    depth += 1;
+                    None
+                }
+                ')' => {
+                    if depth == 0 {
+                        Some(i)
+                    } else {
+                        depth -= 1;
+                        None
+                    }
+                }
+                _ => None,
+            })
+        })?;
         let url = after.get(..url_end)?;
         // A URL is one word: `[text](url "title")` and `[text][ref]` are not links.
         if label.is_empty() || url.is_empty() || url.contains(char::is_whitespace) {
