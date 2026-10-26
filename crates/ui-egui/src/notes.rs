@@ -223,13 +223,13 @@ fn show_lines(ui: &mut Ui, notes: &str, scale: f32) {
         return;
     }
     let (changelog, lines): (Vec<Line<'_>>, Vec<Line<'_>>) = notes.lines().map(classify).partition(|l| full_changelog(l).is_some());
-    let bullets = lines.iter().filter(|l| matches!(l, Line::Bullet(..))).count();
     let (head, rest) = lines.split_at(fold_at(&lines).unwrap_or(lines.len()));
     for line in head {
         draw(ui, line, &t, scale);
     }
     if !rest.is_empty() {
-        let label = crate::i18n::fmt(tl!("Show {n} more changes"), &[("n", &bullets.saturating_sub(SHOWN).to_string())]);
+        let hidden = rest.iter().filter(|l| matches!(l, Line::Bullet(..))).count();
+        let label = crate::i18n::fmt(tl!("Show {n} more changes"), &[("n", &hidden.to_string())]);
         egui::CollapsingHeader::new(label).id_salt(ui.id().with(("more-notes", notes.len()))).show(ui, |ui| {
             for line in rest {
                 draw(ui, line, &t, scale);
